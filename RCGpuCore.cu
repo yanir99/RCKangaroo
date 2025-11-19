@@ -138,8 +138,8 @@ __global__ void KernelA(const TKparams Kparams)
 			SqrModP(tmp2, tmp);
 
 			SubModP(x, tmp2, jmp_x);
-			SubModP(x, x, x0);
-			SAVE_VAL_256(L2x, x, group);
+			SubModP(x, x, x0); 
+			SAVE_VAL_256(L2x, x, group); 
 
 			SubModP(y, x0, x);
 			MulModP(y, y, tmp);

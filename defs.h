@@ -26,23 +26,29 @@ typedef char i8;
 
 #define JMP_CNT				512
 
+//can be 8, 16, 24, 32
+#define PNT_GROUP_NEW_GPU	24
+//can be 8, 16, 24, 32, 40, 48, 56, 64
+#define PNT_GROUP_OLD_GPU	64
+
+#define BLOCK_SIZE_NEW_GPU	256
+#define BLOCK_SIZE_OLD_GPU	512
+ 
 //use different options for cards older than RTX 40xx
 #ifdef __CUDA_ARCH__
-	#if __CUDA_ARCH__ < 890
-		#define OLD_GPU
-	#endif
-	#ifdef OLD_GPU
-		#define BLOCK_SIZE			512
-		//can be 8, 16, 24, 32, 40, 48, 56, 64
-		#define PNT_GROUP_CNT		64	
-	#else
-		#define BLOCK_SIZE			256
-		//can be 8, 16, 24, 32
-		#define PNT_GROUP_CNT		24
-	#endif
+#if __CUDA_ARCH__ < 890
+#define OLD_GPU
+#endif
+#ifdef OLD_GPU
+#define BLOCK_SIZE			BLOCK_SIZE_OLD_GPU		
+#define PNT_GROUP_CNT		PNT_GROUP_OLD_GPU	
+#else
+#define BLOCK_SIZE			BLOCK_SIZE_NEW_GPU	
+#define PNT_GROUP_CNT		PNT_GROUP_NEW_GPU
+#endif
 #else //CPU, fake values
-	#define BLOCK_SIZE			512
-	#define PNT_GROUP_CNT		64
+#define BLOCK_SIZE			BLOCK_SIZE_OLD_GPU
+#define PNT_GROUP_CNT		PNT_GROUP_OLD_GPU
 #endif
 
 // kang type
