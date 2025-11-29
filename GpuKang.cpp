@@ -46,8 +46,8 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		return false;
 
 	Kparams.BlockCnt = mpCnt;
-	Kparams.BlockSize = IsOldGpu ? 512 : 256;
-	Kparams.GroupCnt = IsOldGpu ? 64 : 24;
+	Kparams.BlockSize = IsOldGpu ? BLOCK_SIZE_OLD_GPU : BLOCK_SIZE_NEW_GPU;
+	Kparams.GroupCnt = IsOldGpu ? PNT_GROUP_OLD_GPU : PNT_GROUP_NEW_GPU;
 	KangCnt = Kparams.BlockSize * Kparams.GroupCnt * Kparams.BlockCnt;
 	Kparams.KangCnt = KangCnt;
 	Kparams.DP = DP;
@@ -352,7 +352,7 @@ bool RCGpuKang::Start()
 		return false;
 	}
 /**/
-	//but it's faster to calc then on GPU
+	//but it's faster to calc them on GPU
 	u8 buf_PntA[64], buf_PntB[64];
 	PntA.SaveToBuffer64(buf_PntA);
 	PntB.SaveToBuffer64(buf_PntB);

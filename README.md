@@ -56,6 +56,11 @@ Overall, this translates to roughly a 25% net improvement, which should not be i
 
 <b>Changelog:</b>
 
+v3.1:
+
+- fixed "gpu illegal memory access" bug.
+- some small improvements.
+
 v3.0:
 
 - added "-tames" and "-max" options.
