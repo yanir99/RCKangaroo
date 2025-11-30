@@ -960,6 +960,9 @@ int main(int argc, char* argv[])
                                 printf("Subtracted value: %s\r\n", entry.rawOffset.c_str());
                         printf("Offset: %s\r\n", sStart);
 
+                        if (gUsePubKeyFile)
+                                printf("Running a full %u-bit wild/tame search for this entry before moving to the next one.\r\n", gRange);
+
                         if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
                         {
                                 if (!gIsOpsLimit)
