@@ -4,8 +4,10 @@
 // https://github.com/RetiredC
 
 
+#include <cctype>
+#include <fstream>
 #include <iostream>
-#include <vector>
+#include <string>
 
 #include "cuda_runtime.h"
 #include "cuda.h"
@@ -37,6 +39,209 @@ volatile int PntIndex;
 TFastBase db;
 EcPoint gPntToSolve;
 EcInt gPrivKey;
+char gPubKeyFile[1024];
+bool gUsePubKeyFile;
+
+std::string TrimStr(const std::string& src);
+bool ParseSignedDecimal(const std::string& src, EcInt& val, bool& isNegative);
+
+struct PubKeyEntry
+{
+        EcPoint pubkey;
+        EcInt offset;
+        bool offsetNegative;
+        std::string rawKey;
+        std::string rawOffset;
+};
+
+struct PubKeyFileIterator
+{
+        std::ifstream file;
+        std::string filename;
+        int lineNo = 0;
+        PubKeyEntry original;
+        bool hasOriginal = false;
+        bool firstProvided = false;
+
+        bool Open(const char* fname);
+        bool Next(PubKeyEntry& entry, bool& eof);
+};
+
+PubKeyFileIterator gPubKeyStream;
+PubKeyEntry gOriginalPubKey;
+
+bool ParsePubKeyLine(const std::string& line, int lineNo, PubKeyEntry& entry, bool& isEmpty)
+{
+        std::string trimmed = TrimStr(line);
+        if (trimmed.empty())
+        {
+                isEmpty = true;
+                return true;
+        }
+
+        isEmpty = false;
+        std::string::size_type hashPos = line.find('#');
+        if (hashPos == std::string::npos)
+        {
+                printf("error: line %d must contain '#' separator\r\n", lineNo);
+                return false;
+        }
+
+        std::string keyStr = TrimStr(line.substr(0, hashPos));
+        std::string offsetStr = TrimStr(line.substr(hashPos + 1));
+        if (keyStr.empty())
+                return true; // skip empty key entries
+        if (offsetStr.empty())
+        {
+                printf("error: missing offset value at line %d\r\n", lineNo);
+                return false;
+        }
+
+        entry.rawKey = keyStr;
+        entry.rawOffset = offsetStr;
+        if (!entry.pubkey.SetHexStr(keyStr.c_str()))
+        {
+                printf("error: invalid public key at line %d\r\n", lineNo);
+                return false;
+        }
+        if (!ParseSignedDecimal(offsetStr, entry.offset, entry.offsetNegative))
+        {
+                printf("error: invalid offset value at line %d\r\n", lineNo);
+                return false;
+        }
+        return true;
+}
+
+bool PubKeyFileIterator::Open(const char* fname)
+{
+        filename = fname;
+        file.open(fname);
+        if (!file.is_open())
+        {
+                printf("error: cannot open public keys file %s\r\n", fname);
+                return false;
+        }
+
+        lineNo = 0;
+        hasOriginal = false;
+        firstProvided = false;
+
+        std::string line;
+        while (std::getline(file, line))
+        {
+                lineNo++;
+                bool isEmpty = false;
+                PubKeyEntry entry;
+                if (!ParsePubKeyLine(line, lineNo, entry, isEmpty))
+                        return false;
+                if (isEmpty || entry.rawKey.empty())
+                        continue;
+                if (!entry.offset.IsZero() || entry.offsetNegative)
+                {
+                        printf("error: first line must contain the original public key with zero offset\r\n");
+                        return false;
+                }
+                original = entry;
+                gOriginalPubKey = entry;
+                hasOriginal = true;
+                return true;
+        }
+
+        printf("error: public keys file %s is empty\r\n", fname);
+        return false;
+}
+
+bool PubKeyFileIterator::Next(PubKeyEntry& entry, bool& eof)
+{
+        eof = false;
+        if (!hasOriginal)
+                return false;
+
+        if (!firstProvided)
+        {
+                entry = original;
+                firstProvided = true;
+                return true;
+        }
+
+        std::string line;
+        while (std::getline(file, line))
+        {
+                lineNo++;
+                bool isEmpty = false;
+                if (!ParsePubKeyLine(line, lineNo, entry, isEmpty))
+                        return false;
+                if (isEmpty || entry.rawKey.empty())
+                        continue;
+                return true;
+        }
+
+        eof = true;
+        return true;
+}
+
+std::string TrimStr(const std::string& src)
+{
+        size_t start = 0;
+        while (start < src.size() && isspace((unsigned char)src[start]))
+                start++;
+        size_t end = src.size();
+        while (end > start && isspace((unsigned char)src[end - 1]))
+                end--;
+        return src.substr(start, end - start);
+}
+
+bool ParseSignedDecimal(const std::string& src, EcInt& val, bool& isNegative)
+{
+        std::string trimmed = TrimStr(src);
+        if (trimmed.empty())
+                return false;
+
+        const char* ptr = trimmed.c_str();
+        isNegative = false;
+        if (*ptr == '+' || *ptr == '-')
+        {
+                isNegative = *ptr == '-';
+                ptr++;
+        }
+        if (!*ptr)
+                return false;
+
+        val.SetZero();
+        while (*ptr)
+        {
+                if (!isdigit((unsigned char)*ptr))
+                        return false;
+                int digit = *ptr - '0';
+                EcInt tmp;
+                tmp.Mul_u64(val, 10);
+                val.Assign(tmp);
+                EcInt ad;
+                ad.Set(digit);
+                val.Add(ad);
+                ptr++;
+        }
+        return true;
+}
+
+void ApplySignedOffset(EcInt& value, EcInt& offset, bool isNegative, bool subtract)
+{
+        // when subtract is true, value -= offsetValue; otherwise value += offsetValue
+        if (subtract)
+        {
+                if (isNegative)
+                        value.Add(offset);
+                else
+                        value.Sub(offset);
+        }
+        else
+        {
+                if (isNegative)
+                        value.Sub(offset);
+                else
+                        value.Add(offset);
+        }
+}
 
 volatile u64 TotalOps;
 u32 TotalSolved;
@@ -330,15 +535,28 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	ram /= (1024 * 1024 * 1024); //GB
 	printf("SOTA method, estimated ops: 2^%.3f, RAM for DPs: %.3f GB. DP and GPU overheads not included!\r\n", log2(ops), ram);
 	gIsOpsLimit = false;
-	double MaxTotalOps = 0.0;
-	if (gMax > 0)
-	{
-		MaxTotalOps = gMax * ops;
-		double ram_max = (32 + 4 + 4) * MaxTotalOps / dp_val; //+4 for grow allocation and memory fragmentation
-		ram_max += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
-		ram_max /= (1024 * 1024 * 1024); //GB
-		printf("Max allowed number of ops: 2^%.3f, max RAM for DPs: %.3f GB\r\n", log2(MaxTotalOps), ram_max);
-	}
+        double MaxTotalOps = 0.0;
+        if (gMax > 0)
+        {
+                MaxTotalOps = gMax * ops;
+                double ram_max = (32 + 4 + 4) * MaxTotalOps / dp_val; //+4 for grow allocation and memory fragmentation
+                ram_max += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
+                ram_max /= (1024 * 1024 * 1024); //GB
+                printf("Max allowed number of ops: 2^%.3f, max RAM for DPs: %.3f GB\r\n", log2(MaxTotalOps), ram_max);
+        }
+        else
+        {
+                MaxTotalOps = ops;
+        }
+
+        if (gGenMode && (Range >= 120))
+        {
+                double keys_per_sec = 8.0 * 1000000000.0; //approx 8 GKeys/s upper-bound reference
+                double est_days = (MaxTotalOps / keys_per_sec) / (3600.0 * 24.0);
+                double est_years = est_days / 365.0;
+                printf("Warning: tames generation for %d-bit ranges is extremely expensive (target ops: 2^%.3f).\r\n", Range, log2(MaxTotalOps));
+                printf("Even at ~8 GKeys/s this would take about %.0f days (%.1f years). Consider using a smaller range window or skipping tames.\r\n", est_days, est_years);
+        }
 
 	u64 total_kangs = GpuKangs[0]->CalcKangCnt();
 	for (int i = 1; i < GpuCnt; i++)
@@ -562,21 +780,28 @@ bool ParseCommandLine(int argc, char* argv[])
 			gStartSet = true;
 		}
 		else
-		if (strcmp(argument, "-pubkey") == 0)
-		{
-			if (!gPubKey.SetHexStr(argv[ci]))
-			{
-				printf("error: invalid value for -pubkey option\r\n");
-				return false;
-			}
-			ci++;
-		}
-		else
-		if (strcmp(argument, "-tames") == 0)
-		{
-			strcpy(gTamesFileName, argv[ci]);
-			ci++;
-		}
+                if (strcmp(argument, "-pubkey") == 0)
+                {
+                        if (!gPubKey.SetHexStr(argv[ci]))
+                        {
+                                printf("error: invalid value for -pubkey option\r\n");
+                                return false;
+                        }
+                        ci++;
+                }
+                else
+                if (strcmp(argument, "-pubfile") == 0)
+                {
+                        strcpy(gPubKeyFile, argv[ci]);
+                        ci++;
+                        gUsePubKeyFile = true;
+                }
+                else
+                if (strcmp(argument, "-tames") == 0)
+                {
+                        strcpy(gTamesFileName, argv[ci]);
+                        ci++;
+                }
 		else
 		if (strcmp(argument, "-max") == 0)
 		{
@@ -590,19 +815,24 @@ bool ParseCommandLine(int argc, char* argv[])
 			gMax = val;
 		}
 		else
-		{
-			printf("error: unknown option %s\r\n", argument);
-			return false;
-		}
-	}
-	if (!gPubKey.x.IsZero())
-		if (!gStartSet || !gRange || !gDP)
-		{
-			printf("error: you must also specify -dp, -range and -start options\r\n");
-			return false;
-		}
-	if (gTamesFileName[0] && !IsFileExist(gTamesFileName))
-	{
+                {
+                        printf("error: unknown option %s\r\n", argument);
+                        return false;
+                }
+        }
+        if (!gPubKey.x.IsZero() && gUsePubKeyFile)
+        {
+                printf("error: specify either -pubkey or -pubfile, not both\r\n");
+                return false;
+        }
+        if (!gPubKey.x.IsZero() || gUsePubKeyFile)
+                if (!gStartSet || !gRange || !gDP)
+                {
+                        printf("error: you must also specify -dp, -range and -start options\r\n");
+                        return false;
+                }
+        if (gTamesFileName[0] && !IsFileExist(gTamesFileName))
+        {
 		if (gMax == 0.0)
 		{
 			printf("error: you must also specify -max option to generate tames\r\n");
@@ -636,17 +866,27 @@ int main(int argc, char* argv[])
 	printf("DEBUG MODE\r\n\r\n");
 #endif
 
-	InitEc();
-	gDP = 0;
-	gRange = 0;
-	gStartSet = false;
-	gTamesFileName[0] = 0;
-	gMax = 0.0;
-	gGenMode = false;
-	gIsOpsLimit = false;
-	memset(gGPUs_Mask, 1, sizeof(gGPUs_Mask));
-	if (!ParseCommandLine(argc, argv))
-		return 0;
+        InitEc();
+        gDP = 0;
+        gRange = 0;
+        gStartSet = false;
+        gTamesFileName[0] = 0;
+        gPubKeyFile[0] = 0;
+        gUsePubKeyFile = false;
+        gMax = 0.0;
+        gGenMode = false;
+        gIsOpsLimit = false;
+        memset(gGPUs_Mask, 1, sizeof(gGPUs_Mask));
+        if (!ParseCommandLine(argc, argv))
+                return 0;
+
+        if (gUsePubKeyFile)
+        {
+                if (!gPubKeyStream.Open(gPubKeyFile))
+                        return 0;
+                gPubKey = gPubKeyStream.original.pubkey;
+                printf("Streaming public keys from %s (first entry loaded)\r\n", gPubKeyFile);
+        }
 
 	InitGpus();
 
@@ -661,61 +901,129 @@ int main(int argc, char* argv[])
 	TotalOps = 0;
 	TotalSolved = 0;
 	gTotalErrors = 0;
-	IsBench = gPubKey.x.IsZero();
+        IsBench = gPubKey.x.IsZero() && !gUsePubKeyFile;
 
-	if (!IsBench && !gGenMode)
-	{
-		printf("\r\nMAIN MODE\r\n\r\n");
-		EcPoint PntToSolve, PntOfs;
-		EcInt pk, pk_found;
+        if (!IsBench && !gGenMode)
+        {
+                printf("\r\nMAIN MODE\r\n\r\n");
+                EcPoint PntToSolve, PntOfs;
+                EcInt pk_found;
+                EcInt baseStart = gStart;
 
-		PntToSolve = gPubKey;
-		if (!gStart.IsZero())
-		{
-			PntOfs = ec.MultiplyG(gStart);
-			PntOfs.y.NegModP();
-			PntToSolve = ec.AddPoints(PntToSolve, PntOfs);
-		}
+                size_t idx = 0;
+                bool eof = false;
+                while (1)
+                {
+                        PubKeyEntry entry;
+                        if (gUsePubKeyFile)
+                        {
+                                if (!gPubKeyStream.Next(entry, eof))
+                                        goto label_end;
+                                if (eof)
+                                        break;
+                        }
+                        else
+                        {
+                                if (idx > 0)
+                                        break;
+                                entry.pubkey = gPubKey;
+                                entry.offset.SetZero();
+                                entry.offsetNegative = false;
+                                entry.rawOffset = "0";
+                                char sx[100];
+                                entry.pubkey.x.GetHexStr(sx);
+                                entry.rawKey = sx;
+                        }
+                        gPubKey = entry.pubkey;
+                        gStart = baseStart;
+                        if (gUsePubKeyFile)
+                                ApplySignedOffset(gStart, entry.offset, entry.offsetNegative, true);
 
-		char sx[100], sy[100];
-		gPubKey.x.GetHexStr(sx);
-		gPubKey.y.GetHexStr(sy);
-		printf("Solving public key\r\nX: %s\r\nY: %s\r\n", sx, sy);
-		gStart.GetHexStr(sx);
-		printf("Offset: %s\r\n", sx);
+                        PntToSolve = gPubKey;
+                        if (!gStart.IsZero())
+                        {
+                                PntOfs = ec.MultiplyG(gStart);
+                                PntOfs.y.NegModP();
+                                PntToSolve = ec.AddPoints(PntToSolve, PntOfs);
+                        }
 
-		if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
-		{
-			if (!gIsOpsLimit)
-				printf("FATAL ERROR: SolvePoint failed\r\n");
-			goto label_end;
-		}
-		pk_found.AddModP(gStart);
-		EcPoint tmp = ec.MultiplyG(pk_found);
-		if (!tmp.IsEqual(gPubKey))
-		{
-			printf("FATAL ERROR: SolvePoint found incorrect key\r\n");
-			goto label_end;
-		}
-		//happy end
-		char s[100];
-		pk_found.GetHexStr(s);
-		printf("\r\nPRIVATE KEY: %s\r\n\r\n", s);
-		FILE* fp = fopen("RESULTS.TXT", "a");
-		if (fp)
-		{
-			fprintf(fp, "PRIVATE KEY: %s\n", s);
-			fclose(fp);
-		}
-		else //we cannot save the key, show error and wait forever so the key is displayed
-		{
-			printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
-			while (1)
-				Sleep(100);
-		}
-	}
-	else
-	{
+                        char sx[100], sy[100], sStart[100];
+                        gPubKey.x.GetHexStr(sx);
+                        gPubKey.y.GetHexStr(sy);
+                        gStart.GetHexStr(sStart);
+                        printf("Solving public key");
+                        if (gUsePubKeyFile)
+                                printf(" #%zu", idx);
+                        printf("\r\nX: %s\r\nY: %s\r\n", sx, sy);
+                        if (gUsePubKeyFile)
+                                printf("Subtracted value: %s\r\n", entry.rawOffset.c_str());
+                        printf("Offset: %s\r\n", sStart);
+
+                        if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
+                        {
+                                if (!gIsOpsLimit)
+                                        printf("FATAL ERROR: SolvePoint failed\r\n");
+                                goto label_end;
+                        }
+                        pk_found.AddModP(gStart);
+                        EcPoint tmp = ec.MultiplyG(pk_found);
+                        if (!tmp.IsEqual(gPubKey))
+                        {
+                                printf("FATAL ERROR: SolvePoint found incorrect key\r\n");
+                                goto label_end;
+                        }
+
+                        //happy end
+                        char s[100];
+                        pk_found.GetHexStr(s);
+                        if (gUsePubKeyFile)
+                                printf("\r\nMATCHED PUBLIC KEY: %s\r\n", entry.rawKey.c_str());
+                        printf("PRIVATE KEY: %s\r\n", s);
+
+                        EcInt restoredPriv = pk_found;
+                        if (gUsePubKeyFile)
+                        {
+                                ApplySignedOffset(restoredPriv, entry.offset, entry.offsetNegative, false);
+                                EcPoint restoredPub = ec.MultiplyG(restoredPriv);
+                                if (!restoredPub.IsEqual(gOriginalPubKey.pubkey))
+                                        printf("WARNING: restored original public key does not match the first entry\r\n");
+                                char restoredPkStr[100];
+                                restoredPriv.GetHexStr(restoredPkStr);
+                                printf("\r\nORIGINAL PUBLIC KEY: %s\r\nORIGINAL PRIVATE KEY: %s\r\n", gOriginalPubKey.rawKey.c_str(), restoredPkStr);
+                        }
+                        else
+                                printf("\r\n");
+
+                        FILE* fp = fopen("RESULTS.TXT", "a");
+                        if (fp)
+                        {
+                                if (gUsePubKeyFile)
+                                {
+                                        char restoredPkStr[100];
+                                        restoredPriv.GetHexStr(restoredPkStr);
+                                        fprintf(fp, "MATCHED PUBLIC KEY: %s\n", entry.rawKey.c_str());
+                                        fprintf(fp, "MATCHED PRIVATE KEY: %s\n", s);
+                                        fprintf(fp, "ORIGINAL PUBLIC KEY: %s\n", gOriginalPubKey.rawKey.c_str());
+                                        fprintf(fp, "ORIGINAL PRIVATE KEY: %s\n\n", restoredPkStr);
+                                }
+                                else
+                                {
+                                        fprintf(fp, "PRIVATE KEY: %s\n", s);
+                                }
+                                fclose(fp);
+                        }
+                        else //we cannot save the key, show error and wait forever so the key is displayed
+                        {
+                                printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
+                                while (1)
+                                        Sleep(100);
+                        }
+                        idx++;
+                        break;
+                }
+        }
+        else
+        {
 		if (gGenMode)
 			printf("\r\nTAMES GENERATION MODE\r\n");
 		else
