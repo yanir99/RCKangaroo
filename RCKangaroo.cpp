@@ -912,6 +912,7 @@ int main(int argc, char* argv[])
 
                 size_t idx = 0;
                 bool eof = false;
+                bool found = false;
                 while (1)
                 {
                         PubKeyEntry entry;
@@ -1018,9 +1019,12 @@ int main(int argc, char* argv[])
                                 while (1)
                                         Sleep(100);
                         }
+                        found = true;
                         idx++;
                         break;
                 }
+                if (gUsePubKeyFile && !found)
+                        printf("Reached end of public keys file without a solution\r\n");
         }
         else
         {
