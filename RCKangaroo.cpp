@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "cuda_runtime.h"
 #include "cuda.h"
@@ -44,6 +45,7 @@ bool gUsePubKeyFile;
 
 std::string TrimStr(const std::string& src);
 bool ParseSignedDecimal(const std::string& src, EcInt& val, bool& isNegative);
+bool LoadPubKeyFile(const char* fname, const EcInt& baseStart);
 
 struct PubKeyEntry
 {
@@ -54,21 +56,16 @@ struct PubKeyEntry
         std::string rawOffset;
 };
 
-struct PubKeyFileIterator
+struct PubKeyTarget
 {
-        std::ifstream file;
-        std::string filename;
-        int lineNo = 0;
-        PubKeyEntry original;
-        bool hasOriginal = false;
-        bool firstProvided = false;
-
-        bool Open(const char* fname);
-        bool Next(PubKeyEntry& entry, bool& eof);
+        PubKeyEntry entry;
+        EcInt startValue;
+        EcPoint pointToSolve;
 };
 
-PubKeyFileIterator gPubKeyStream;
+std::vector<PubKeyTarget> gPubKeyTargets;
 PubKeyEntry gOriginalPubKey;
+int gMatchedTargetIndex = -1;
 
 bool ParsePubKeyLine(const std::string& line, int lineNo, PubKeyEntry& entry, bool& isEmpty)
 {
@@ -112,21 +109,18 @@ bool ParsePubKeyLine(const std::string& line, int lineNo, PubKeyEntry& entry, bo
         return true;
 }
 
-bool PubKeyFileIterator::Open(const char* fname)
+bool LoadPubKeyFile(const char* fname, const EcInt& baseStart)
 {
-        filename = fname;
-        file.open(fname);
+        std::ifstream file(fname);
         if (!file.is_open())
         {
                 printf("error: cannot open public keys file %s\r\n", fname);
                 return false;
         }
 
-        lineNo = 0;
-        hasOriginal = false;
-        firstProvided = false;
-
+        gPubKeyTargets.clear();
         std::string line;
+        int lineNo = 0;
         while (std::getline(file, line))
         {
                 lineNo++;
@@ -136,47 +130,38 @@ bool PubKeyFileIterator::Open(const char* fname)
                         return false;
                 if (isEmpty || entry.rawKey.empty())
                         continue;
-                if (!entry.offset.IsZero() || entry.offsetNegative)
+
+                if (gPubKeyTargets.empty())
                 {
-                        printf("error: first line must contain the original public key with zero offset\r\n");
-                        return false;
+                        if (!entry.offset.IsZero() || entry.offsetNegative)
+                        {
+                                printf("error: first line must contain the original public key with zero offset\r\n");
+                                return false;
+                        }
+                        gOriginalPubKey = entry;
                 }
-                original = entry;
-                gOriginalPubKey = entry;
-                hasOriginal = true;
-                return true;
+
+                PubKeyTarget target;
+                target.entry = entry;
+                target.startValue = baseStart;
+                ApplySignedOffset(target.startValue, entry.offset, entry.offsetNegative, true);
+                target.pointToSolve = entry.pubkey;
+                if (!target.startValue.IsZero())
+                {
+                        EcPoint pntOfs = ec.MultiplyG(target.startValue);
+                        pntOfs.y.NegModP();
+                        target.pointToSolve = ec.AddPoints(target.pointToSolve, pntOfs);
+                }
+
+                gPubKeyTargets.push_back(target);
         }
 
-        printf("error: public keys file %s is empty\r\n", fname);
-        return false;
-}
-
-bool PubKeyFileIterator::Next(PubKeyEntry& entry, bool& eof)
-{
-        eof = false;
-        if (!hasOriginal)
+        if (gPubKeyTargets.empty())
+        {
+                printf("error: public keys file %s is empty\r\n", fname);
                 return false;
-
-        if (!firstProvided)
-        {
-                entry = original;
-                firstProvided = true;
-                return true;
         }
 
-        std::string line;
-        while (std::getline(file, line))
-        {
-                lineNo++;
-                bool isEmpty = false;
-                if (!ParsePubKeyLine(line, lineNo, entry, isEmpty))
-                        return false;
-                if (isEmpty || entry.rawKey.empty())
-                        continue;
-                return true;
-        }
-
-        eof = true;
         return true;
 }
 
@@ -460,7 +445,24 @@ void CheckNewPoints()
 				WildType = nrec.type;
 			}
 
-			bool res = Collision_SOTA(gPntToSolve, t, TameType, w, WildType, false) || Collision_SOTA(gPntToSolve, t, TameType, w, WildType, true);
+                        bool res = false;
+                        if (gUsePubKeyFile)
+                        {
+                                for (size_t targetIdx = 0; targetIdx < gPubKeyTargets.size(); targetIdx++)
+                                {
+                                        if (Collision_SOTA(gPubKeyTargets[targetIdx].pointToSolve, t, TameType, w, WildType, false) ||
+                                                Collision_SOTA(gPubKeyTargets[targetIdx].pointToSolve, t, TameType, w, WildType, true))
+                                        {
+                                                gMatchedTargetIndex = (int)targetIdx;
+                                                res = true;
+                                                break;
+                                        }
+                                }
+                        }
+                        else
+                        {
+                                res = Collision_SOTA(gPntToSolve, t, TameType, w, WildType, false) || Collision_SOTA(gPntToSolve, t, TameType, w, WildType, true);
+                        }
 			if (!res)
 			{
 				bool w12 = ((pref->type == WILD1) && (nrec.type == WILD2)) || ((pref->type == WILD2) && (nrec.type == WILD1));
@@ -516,18 +518,21 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 
 bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 {
-	if ((Range < 32) || (Range > 180))
-	{
-		printf("Unsupported Range value (%d)!\r\n", Range);
+        if ((Range < 32) || (Range > 180))
+        {
+                printf("Unsupported Range value (%d)!\r\n", Range);
 		return false;
 	}
 	if ((DP < 14) || (DP > 60)) 
 	{
 		printf("Unsupported DP value (%d)!\r\n", DP);
 		return false;
-	}
+        }
 
-	printf("\r\nSolving point: Range %d bits, DP %d, start...\r\n", Range, DP);
+        if (gUsePubKeyFile)
+                gMatchedTargetIndex = -1;
+
+        printf("\r\nSolving point: Range %d bits, DP %d, start...\r\n", Range, DP);
 	double ops = 1.15 * pow(2.0, Range / 2.0);
 	double dp_val = (double)(1ull << DP);
 	double ram = (32 + 4 + 4) * ops / dp_val; //+4 for grow allocation and memory fragmentation
@@ -882,10 +887,10 @@ int main(int argc, char* argv[])
 
         if (gUsePubKeyFile)
         {
-                if (!gPubKeyStream.Open(gPubKeyFile))
+                if (!LoadPubKeyFile(gPubKeyFile, gStart))
                         return 0;
-                gPubKey = gPubKeyStream.original.pubkey;
-                printf("Streaming public keys from %s (first entry loaded)\r\n", gPubKeyFile);
+                gPubKey = gOriginalPubKey.pubkey;
+                printf("Loaded %zu public keys from %s; testing all entries per wild/tame step.\r\n", gPubKeyTargets.size(), gPubKeyFile);
         }
 
 	InitGpus();
@@ -908,38 +913,8 @@ int main(int argc, char* argv[])
                 printf("\r\nMAIN MODE\r\n\r\n");
                 EcPoint PntToSolve, PntOfs;
                 EcInt pk_found;
-                EcInt baseStart = gStart;
-
-                size_t idx = 0;
-                bool eof = false;
-                bool found = false;
-                while (1)
+                if (!gUsePubKeyFile)
                 {
-                        PubKeyEntry entry;
-                        if (gUsePubKeyFile)
-                        {
-                                if (!gPubKeyStream.Next(entry, eof))
-                                        goto label_end;
-                                if (eof)
-                                        break;
-                        }
-                        else
-                        {
-                                if (idx > 0)
-                                        break;
-                                entry.pubkey = gPubKey;
-                                entry.offset.SetZero();
-                                entry.offsetNegative = false;
-                                entry.rawOffset = "0";
-                                char sx[100];
-                                entry.pubkey.x.GetHexStr(sx);
-                                entry.rawKey = sx;
-                        }
-                        gPubKey = entry.pubkey;
-                        gStart = baseStart;
-                        if (gUsePubKeyFile)
-                                ApplySignedOffset(gStart, entry.offset, entry.offsetNegative, true);
-
                         PntToSolve = gPubKey;
                         if (!gStart.IsZero())
                         {
@@ -947,87 +922,105 @@ int main(int argc, char* argv[])
                                 PntOfs.y.NegModP();
                                 PntToSolve = ec.AddPoints(PntToSolve, PntOfs);
                         }
+                }
+                else
+                {
+                        PubKeyTarget& primary = gPubKeyTargets[0];
+                        gStart = primary.startValue;
+                        gPubKey = primary.entry.pubkey;
+                        PntToSolve = primary.pointToSolve;
+                }
 
-                        char sx[100], sy[100], sStart[100];
-                        gPubKey.x.GetHexStr(sx);
-                        gPubKey.y.GetHexStr(sy);
-                        gStart.GetHexStr(sStart);
-                        printf("Solving public key");
-                        if (gUsePubKeyFile)
-                                printf(" #%zu", idx);
-                        printf("\r\nX: %s\r\nY: %s\r\n", sx, sy);
-                        if (gUsePubKeyFile)
-                                printf("Subtracted value: %s\r\n", entry.rawOffset.c_str());
+                char sx[100], sy[100], sStart[100];
+                gPubKey.x.GetHexStr(sx);
+                gPubKey.y.GetHexStr(sy);
+                gStart.GetHexStr(sStart);
+                printf("Solving public key\r\nX: %s\r\nY: %s\r\n", sx, sy);
+                if (gUsePubKeyFile)
+                {
+                        printf("Subtracted value: %s\r\n", gPubKeyTargets[0].entry.rawOffset.c_str());
+                        printf("Offset: %s\r\n", sStart);
+                        printf("Each distinguished point is checked against all %zu public keys from the file.\r\n", gPubKeyTargets.size());
+                }
+                else
                         printf("Offset: %s\r\n", sStart);
 
-                        if (gUsePubKeyFile)
-                                printf("Running a full %u-bit wild/tame search for this entry before moving to the next one.\r\n", gRange);
+                if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
+                {
+                        if (!gIsOpsLimit)
+                                printf("FATAL ERROR: SolvePoint failed\r\n");
+                        goto label_end;
+                }
 
-                        if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
+                const PubKeyTarget* matchedTarget = nullptr;
+                if (gUsePubKeyFile)
+                {
+                        if (gMatchedTargetIndex < 0 || gMatchedTargetIndex >= (int)gPubKeyTargets.size())
                         {
-                                if (!gIsOpsLimit)
-                                        printf("FATAL ERROR: SolvePoint failed\r\n");
+                                printf("FATAL ERROR: Matched target index out of range\r\n");
                                 goto label_end;
                         }
+                        matchedTarget = &gPubKeyTargets[(size_t)gMatchedTargetIndex];
+                        pk_found.AddModP(matchedTarget->startValue);
+                        gPubKey = matchedTarget->entry.pubkey;
+                }
+                else
+                {
                         pk_found.AddModP(gStart);
-                        EcPoint tmp = ec.MultiplyG(pk_found);
-                        if (!tmp.IsEqual(gPubKey))
-                        {
-                                printf("FATAL ERROR: SolvePoint found incorrect key\r\n");
-                                goto label_end;
-                        }
+                }
 
-                        //happy end
-                        char s[100];
-                        pk_found.GetHexStr(s);
-                        if (gUsePubKeyFile)
-                                printf("\r\nMATCHED PUBLIC KEY: %s\r\n", entry.rawKey.c_str());
-                        printf("PRIVATE KEY: %s\r\n", s);
+                EcPoint tmp = ec.MultiplyG(pk_found);
+                if (!tmp.IsEqual(gPubKey))
+                {
+                        printf("FATAL ERROR: SolvePoint found incorrect key\r\n");
+                        goto label_end;
+                }
 
-                        EcInt restoredPriv = pk_found;
+                //happy end
+                char s[100];
+                pk_found.GetHexStr(s);
+                if (gUsePubKeyFile)
+                        printf("\r\nMATCHED PUBLIC KEY: %s\r\n", matchedTarget->entry.rawKey.c_str());
+                printf("PRIVATE KEY: %s\r\n", s);
+
+                EcInt restoredPriv = pk_found;
+                if (gUsePubKeyFile)
+                {
+                        ApplySignedOffset(restoredPriv, matchedTarget->entry.offset, matchedTarget->entry.offsetNegative, false);
+                        EcPoint restoredPub = ec.MultiplyG(restoredPriv);
+                        if (!restoredPub.IsEqual(gOriginalPubKey.pubkey))
+                                printf("WARNING: restored original public key does not match the first entry\r\n");
+                        char restoredPkStr[100];
+                        restoredPriv.GetHexStr(restoredPkStr);
+                        printf("\r\nORIGINAL PUBLIC KEY: %s\r\nORIGINAL PRIVATE KEY: %s\r\n", gOriginalPubKey.rawKey.c_str(), restoredPkStr);
+                }
+                else
+                        printf("\r\n");
+
+                FILE* fp = fopen("RESULTS.TXT", "a");
+                if (fp)
+                {
                         if (gUsePubKeyFile)
                         {
-                                ApplySignedOffset(restoredPriv, entry.offset, entry.offsetNegative, false);
-                                EcPoint restoredPub = ec.MultiplyG(restoredPriv);
-                                if (!restoredPub.IsEqual(gOriginalPubKey.pubkey))
-                                        printf("WARNING: restored original public key does not match the first entry\r\n");
                                 char restoredPkStr[100];
                                 restoredPriv.GetHexStr(restoredPkStr);
-                                printf("\r\nORIGINAL PUBLIC KEY: %s\r\nORIGINAL PRIVATE KEY: %s\r\n", gOriginalPubKey.rawKey.c_str(), restoredPkStr);
+                                fprintf(fp, "MATCHED PUBLIC KEY: %s\n", matchedTarget->entry.rawKey.c_str());
+                                fprintf(fp, "MATCHED PRIVATE KEY: %s\n", s);
+                                fprintf(fp, "ORIGINAL PUBLIC KEY: %s\n", gOriginalPubKey.rawKey.c_str());
+                                fprintf(fp, "ORIGINAL PRIVATE KEY: %s\n\n", restoredPkStr);
                         }
                         else
-                                printf("\r\n");
-
-                        FILE* fp = fopen("RESULTS.TXT", "a");
-                        if (fp)
                         {
-                                if (gUsePubKeyFile)
-                                {
-                                        char restoredPkStr[100];
-                                        restoredPriv.GetHexStr(restoredPkStr);
-                                        fprintf(fp, "MATCHED PUBLIC KEY: %s\n", entry.rawKey.c_str());
-                                        fprintf(fp, "MATCHED PRIVATE KEY: %s\n", s);
-                                        fprintf(fp, "ORIGINAL PUBLIC KEY: %s\n", gOriginalPubKey.rawKey.c_str());
-                                        fprintf(fp, "ORIGINAL PRIVATE KEY: %s\n\n", restoredPkStr);
-                                }
-                                else
-                                {
-                                        fprintf(fp, "PRIVATE KEY: %s\n", s);
-                                }
-                                fclose(fp);
+                                fprintf(fp, "PRIVATE KEY: %s\n", s);
                         }
-                        else //we cannot save the key, show error and wait forever so the key is displayed
-                        {
-                                printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
-                                while (1)
-                                        Sleep(100);
-                        }
-                        found = true;
-                        idx++;
-                        break;
+                        fclose(fp);
                 }
-                if (gUsePubKeyFile && !found)
-                        printf("Reached end of public keys file without a solution\r\n");
+                else //we cannot save the key, show error and wait forever so the key is displayed
+                {
+                        printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
+                        while (1)
+                                Sleep(100);
+                }
         }
         else
         {
