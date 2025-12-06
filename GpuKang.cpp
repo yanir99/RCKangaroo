@@ -33,8 +33,10 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	EcJumps1 = _EcJumps1;
 	EcJumps2 = _EcJumps2;
 	EcJumps3 = _EcJumps3;
-	StopFlag = false;
-	Failed = false;
+        StopFlag = false;
+        Failed = false;
+        DpBufferPinned = false;
+        DPs_out = nullptr;
 	u64 total_mem = 0;
 	memset(dbg, 0, sizeof(dbg));
 	memset(SpeedStats, 0, sizeof(SpeedStats));
@@ -191,7 +193,21 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		return false;
 	}
 
-	DPs_out = (u32*)malloc(MAX_DP_CNT * GPU_DP_SIZE);
+        err = cudaHostAlloc((void**)&DPs_out, MAX_DP_CNT * GPU_DP_SIZE, cudaHostAllocDefault);
+        if (err == cudaSuccess)
+        {
+                DpBufferPinned = true;
+        }
+        else
+        {
+                printf("GPU %d, cudaHostAlloc for DP buffer failed (%s), fallback to pageable memory.\n", CudaIndex, cudaGetErrorString(err));
+                DPs_out = (u32*)malloc(MAX_DP_CNT * GPU_DP_SIZE);
+                if (!DPs_out)
+                {
+                        printf("GPU %d, host DP buffer allocation failed.\n", CudaIndex);
+                        return false;
+                }
+        }
 
 //jmp1
 	u64* buf = (u64*)malloc(JMP_CNT * 96);
@@ -257,13 +273,19 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 
 void RCGpuKang::Release()
 {
-	free(RndPnts);
-	free(DPs_out);
-	cudaFree(Kparams.LoopedKangs);
-	cudaFree(Kparams.dbg_buf);
-	cudaFree(Kparams.LoopTable);
-	cudaFree(Kparams.LastPnts);
-	cudaFree(Kparams.L1S2);
+        free(RndPnts);
+        if (DPs_out)
+        {
+                if (DpBufferPinned)
+                        cudaFreeHost(DPs_out);
+                else
+                        free(DPs_out);
+        }
+        cudaFree(Kparams.LoopedKangs);
+        cudaFree(Kparams.dbg_buf);
+        cudaFree(Kparams.LoopTable);
+        cudaFree(Kparams.LastPnts);
+        cudaFree(Kparams.L1S2);
 	cudaFree(Kparams.DPTable);
 	cudaFree(Kparams.JumpsList);
 	cudaFree(Kparams.Jumps3);

@@ -27,14 +27,15 @@ struct TPointPriv
 class RCGpuKang
 {
 private:
-	bool StopFlag;
-	EcPoint PntToSolve;
-	int Range; //in bits
-	int DP; //in bits
-	Ec ec;
+        bool StopFlag;
+        EcPoint PntToSolve;
+        int Range; //in bits
+        int DP; //in bits
+        Ec ec;
 
-	u32* DPs_out;
-	TKparams Kparams;
+        u32* DPs_out;
+        bool DpBufferPinned;
+        TKparams Kparams;
 
 	EcInt HalfRange;
 	EcPoint PntHalfRange;
