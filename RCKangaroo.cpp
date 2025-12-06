@@ -5,6 +5,7 @@
 
 
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -196,6 +197,7 @@ char gTamesFileName[1024];
 double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
+u64 gSeed;
 
 #pragma pack(push, 1)
 struct DBRec
@@ -505,12 +507,14 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 			printf("tames loading failed\r\n");
 	}
 
-	SetRndSeed(0); //use same seed to make tames from file compatible
-	PntTotalOps = 0;
-	PntIndex = 0;
+        u64 jumpSeed = gSeed; //keep default zero for compatibility with previously generated tames
+        printf("Random seed for jumps/tames: %llu%s\r\n", jumpSeed, gSeed ? " (user)" : " (compatibility default)");
+        SetRndSeed(jumpSeed);
+        PntTotalOps = 0;
+        PntIndex = 0;
 //prepare jumps
-	EcInt minjump, t;
-	minjump.Set(1);
+        EcInt minjump, t;
+        minjump.Set(1);
 	minjump.ShiftLeft(Range / 2 + 3);
 	for (int i = 0; i < JMP_CNT; i++)
 	{
@@ -539,10 +543,12 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		EcJumps3[i].dist = minjump;
 		t.RndMax(minjump);
 		EcJumps3[i].dist.Add(t);
-		EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
-		EcJumps3[i].p = ec.MultiplyG(EcJumps3[i].dist);
-	}
-	SetRndSeed(GetTickCount64());
+                EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
+                EcJumps3[i].p = ec.MultiplyG(EcJumps3[i].dist);
+        }
+        u64 runtimeSeed = gSeed ? gSeed : GetTickCount64();
+        SetRndSeed(runtimeSeed);
+        printf("Random seed for kangaroo starts: %llu%s\r\n", runtimeSeed, gSeed ? " (user)" : " (auto)");
 
 	Int_HalfRange.Set(1);
 	Int_HalfRange.ShiftLeft(Range - 1);
@@ -726,19 +732,32 @@ bool ParseCommandLine(int argc, char* argv[])
                         strcpy(gTamesFileName, argv[ci]);
                         ci++;
                 }
-		else
-		if (strcmp(argument, "-max") == 0)
-		{
-			double val = atof(argv[ci]);
-			ci++;
+                else
+                if (strcmp(argument, "-max") == 0)
+                {
+                        double val = atof(argv[ci]);
+                        ci++;
 			if (val < 0.001)
 			{
 				printf("error: invalid value for -max option\r\n");
-				return false;
-			}
-			gMax = val;
-		}
-		else
+                                return false;
+                        }
+                        gMax = val;
+                }
+                else
+                if (strcmp(argument, "-seed") == 0)
+                {
+                        char* end = nullptr;
+                        unsigned long long val = strtoull(argv[ci], &end, 0);
+                        if (!argv[ci][0] || (end && *end))
+                        {
+                                printf("error: invalid value for -seed option\r\n");
+                                return false;
+                        }
+                        ci++;
+                        gSeed = val;
+                }
+                else
                 {
                         printf("error: unknown option %s\r\n", argument);
                         return false;
@@ -798,6 +817,7 @@ int main(int argc, char* argv[])
         gPubKeyFile[0] = 0;
         gUsePubKeyFile = false;
         gMax = 0.0;
+        gSeed = 0;
         gGenMode = false;
         gIsOpsLimit = false;
         memset(gGPUs_Mask, 1, sizeof(gGPUs_Mask));

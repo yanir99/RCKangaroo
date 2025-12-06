@@ -36,6 +36,8 @@ Discussion thread: https://bitcointalk.org/index.php?topic=5517607
 
 <b>-tames</b>		filename with tames. If file not found, software generates tames (option "-max" is required) and saves them to the file. If the file is found, software loads tames to speedup solving. 
 
+<b>-seed</b>		set a custom 64-bit seed for jump table generation and kangaroo initialization. Useful to diversify runs (for example, multiple attempts on puzzle #135) while keeping deterministic tames when reusing the same seed. Default seed is 0 for backward compatibility.
+
 When public key is solved, software displays it and also writes it to "RESULTS.TXT" file. 
 
 Sample command line for puzzle #85:
